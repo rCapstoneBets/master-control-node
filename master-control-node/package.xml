@@ -4,7 +4,7 @@
   <name>master-control-node</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="coalman321@todo.todo">coalman321</maintainer>
+  <maintainer email="cjtucker321@gmail.com">coalman321</maintainer>
   <license>TODO: License declaration</license>
 
   <test_depend>ament_copyright</test_depend>
