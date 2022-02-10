@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = 'master-control-node'
+package_name = 'master_control_node'
 
 setup(
     name=package_name,
@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'master_control = master_control_node.master_control:main'
         ],
     },
 )
