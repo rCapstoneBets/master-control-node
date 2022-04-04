@@ -88,7 +88,7 @@ class MasterControl(Node):
         self.signalSub = self.create_subscription(Bool, "/signal", self.playerSignalCb, qos_profile_system_default)
         self.playerSignal = False
 
-        self.enableSysSub = self.create_subscription(Bool, "/enable_sys", self.playerSignalCb, qos_profile_system_default)
+        self.enableSysSub = self.create_subscription(Bool, "/enable_sys", self.enableSysCb, qos_profile_system_default)
         self.lastEnableSys = False
         self.lastEnableTime = Time()
 
@@ -127,6 +127,7 @@ class MasterControl(Node):
         elif(self.state == 3):
             if(self.enableTimer.is_canceled()):
                 self.enableTimer.reset()
+                self.get_logger().info("Moving robot to idle state!")
             
             # begin move to idle state and spin wheels
             self.moveMachine(IDLE_STATE) 
@@ -230,8 +231,12 @@ class MasterControl(Node):
 
         # handle whole system enable / disable if told to disable or enable times out (1/4 of a second)
         if(not self.lastEnableSys or (self.get_clock().now() - self.lastEnableTime) > Duration(nanoseconds=250000000)):
-            self.state = 2
+            if(self.lastEnableSys): # prevent console spam in timeout event
+                self.get_logger().warning("System timed out from last system wide enable")
+                self.lastEnableSys = False
 
+            self.state = 2
+            
         # enable if we were told to and state is sleep
         elif(self.lastEnableSys and self.state == 2):
             self.state = 3
