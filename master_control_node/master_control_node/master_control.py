@@ -19,15 +19,15 @@ ANGULAR_TOLERANCE = 1.0
 
 # common states for the system
 IDLE_STATE = [ # full system idle in level position
-    {"dem": 50.0, "mod": 1, "name": "pan_motor"},
-    {"dem": 00.0, "mod": 1, "name": "tilt_motor"},
+    {"dem": 00.0, "mod": 1, "name": "pan_motor"},
+    {"dem": 30.0, "mod": 1, "name": "tilt_motor"},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
     {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
 ]
 
 FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
-    {"dem": 0.5, "mod": 0, "name": "fire_solenoid"}
+    {"dem": 1.0, "mod": 0, "name": "fire_solenoid"}
 ]
 
 
@@ -91,6 +91,8 @@ class MasterControl(Node):
         self.enableSysSub = self.create_subscription(Bool, "/enable_sys", self.enableSysCb, qos_profile_system_default)
         self.lastEnableSys = False
         self.lastEnableTime = Time()
+
+        self.stateSetSub = self.create_subscription(UInt8, '/state_set', self.setStateCb, qos_profile_system_default)
 
         # setup services
 
@@ -308,6 +310,9 @@ class MasterControl(Node):
     def enableSysCb(self, msg):
         self.lastEnableSys = msg.data
         self.lastEnableTime = self.get_clock().now()
+
+    def setStateCb(self, msg):
+        self.state = msg.data
 
 
 def main(args=None):
