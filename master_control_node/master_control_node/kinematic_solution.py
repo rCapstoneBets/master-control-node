@@ -9,22 +9,25 @@ from can_msgs.msg import MotorMsg
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Pose
 
+import math
+
 IDLE_STATE = [ # full system idle in level position
     {"dem": 00.0, "mod": 7, "name": "pan_motor"},
-    {"dem": 30.0, "mod": 7, "name": "tilt_motor"},
+    {"dem": 00.5, "mod": 7, "name": "tilt_motor"},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
 ]
 
 FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
-    {"dem": 1.0, "mod": 0, "name": "fire_solenoid"}
+    {"dem": 150.0, "mod": 0, "name": "fire_solenoid"}
 ]
 
 END_FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
     {"dem": 0.0, "mod": 0, "name": "fire_solenoid"}
 ]
 
-FIRE_TIME = 1.0
+FIRE_TIME = 1.0 * 1000000000 # in ns
+FIRE_TIME_TOGGLE = 0.06 * 1000000000 # in ns
 
 class MasterControl(Node):
     def __init__(self):
@@ -36,7 +39,10 @@ class MasterControl(Node):
         # internal vars
         self.firstIteration = True
         self.wantFire = False
+        # self.isFiring = False
         self.fireBegin = self.get_clock().now()
+        # self.fireStrobe = self.get_clock().now()
+        self.toggleIndex = 0
         self.lastDemandState = IDLE_STATE
 
         self.motorPubs = {
@@ -44,7 +50,7 @@ class MasterControl(Node):
             "right_wheel_motor": self.create_publisher(MotorMsg, "/motor/right_wheel_motor/demand", qos_profile_system_default),
             "tilt_motor": self.create_publisher(MotorMsg, "/motor/tilt_motor/demand", qos_profile_system_default),
             "pan_motor": self.create_publisher(MotorMsg, "/motor/pan_motor/demand", qos_profile_system_default),
-            "fire_solenoid": self.create_publisher(MotorMsg, "/motor/pan_motor/demand", qos_profile_system_default),
+            "fire_solenoid": self.create_publisher(MotorMsg, "/motor/fire_solenoid/demand", qos_profile_system_default),
         }
 
         self.get_logger().info("Kinematic control initalized")
@@ -73,13 +79,26 @@ class MasterControl(Node):
         if(self.firstIteration):
             # wake machine up
             self.moveMachine(self.lastDemandState)
+            self.firstIteration = False
+            return
 
         # handle the firing timer first
         if(self.wantFire):
-            if(self.get_clock().now() > Duration(seconds = 1.0) +  self.fireBegin):
+            if(self.get_clock().now() > Duration(nanoseconds=int(FIRE_TIME)) + self.fireBegin):
                 self.moveMachine(END_FIRE_STATE)
                 self.wantFire = False
+                self.toggleIndex = 0
                 self.get_logger().info("Firing complete") 
+
+            elif(self.toggleIndex % 2 == 0 and self.get_clock().now() > Duration(nanoseconds=int((self.toggleIndex + 1) * FIRE_TIME_TOGGLE)) + self.fireBegin):
+                self.toggleIndex = self.toggleIndex + 1
+                self.get_logger().info(f"Enabling solenoid")
+                self.moveMachine(FIRE_STATE)
+
+            elif(self.toggleIndex % 2 == 1 and self.get_clock().now() > Duration(nanoseconds=int(self.toggleIndex * FIRE_TIME_TOGGLE)) + self.fireBegin):
+                self.toggleIndex = self.toggleIndex + 1
+                self.get_logger().info(f"Disabling solenoid")
+                self.moveMachine(END_FIRE_STATE)
 
         # take user input
         else:
@@ -88,6 +107,7 @@ class MasterControl(Node):
                 # fire logic
                 self.get_logger().info("Firing ball")   
                 self.fireBegin = self.get_clock().now()
+                # self.fireStrobe = self.get_clock().now()
                 self.wantFire = True   
                 self.moveMachine(FIRE_STATE)
                 
@@ -118,9 +138,7 @@ class MasterControl(Node):
                                 self.updateDemandState('left_wheel_motor', demand)
                                 self.updateDemandState('right_wheel_motor', demand)
                             else:
-                                self.updateDemandState(joint, demand)
-                            
-                            
+                                self.updateDemandState(joint, demand)        
 
                 self.moveMachine(self.lastDemandState)
 
