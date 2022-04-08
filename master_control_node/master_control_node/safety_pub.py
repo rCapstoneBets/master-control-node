@@ -13,6 +13,8 @@ class MasterControl(Node):
         # setup publishers
         self.safetyPub = self.create_publisher(Bool, "/safety_enable", qos_profile_system_default)
 
+        self.get_logger().warning("System enabled!")
+
     def sendSafetyEnable(self):
         msg = Bool()
         msg.data = True

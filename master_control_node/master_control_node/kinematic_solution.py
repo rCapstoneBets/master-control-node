@@ -92,12 +92,10 @@ class MasterControl(Node):
 
             elif(self.toggleIndex % 2 == 0 and self.get_clock().now() > Duration(nanoseconds=int((self.toggleIndex + 1) * FIRE_TIME_TOGGLE)) + self.fireBegin):
                 self.toggleIndex = self.toggleIndex + 1
-                self.get_logger().info(f"Enabling solenoid")
                 self.moveMachine(FIRE_STATE)
 
             elif(self.toggleIndex % 2 == 1 and self.get_clock().now() > Duration(nanoseconds=int(self.toggleIndex * FIRE_TIME_TOGGLE)) + self.fireBegin):
                 self.toggleIndex = self.toggleIndex + 1
-                self.get_logger().info(f"Disabling solenoid")
                 self.moveMachine(END_FIRE_STATE)
 
         # take user input
