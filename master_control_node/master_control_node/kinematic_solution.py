@@ -16,6 +16,7 @@ IDLE_STATE = [ # full system idle in level position
     {"dem": 00.5, "mod": 7, "name": "tilt_motor"},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
+    {"dem": 0.0, "mod": 0, "name": "fire_solenoid"}
 ]
 
 FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
@@ -26,8 +27,8 @@ END_FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
     {"dem": 0.0, "mod": 0, "name": "fire_solenoid"}
 ]
 
-FIRE_TIME = 1.0 * 1000000000 # in ns
-FIRE_TIME_TOGGLE = 0.06 * 1000000000 # in ns
+FIRE_TIME = 0.2 * 1000000000 # in ns
+FIRE_TIME_TOGGLE = 0.29 * 1000000000 # in ns
 
 class MasterControl(Node):
     def __init__(self):

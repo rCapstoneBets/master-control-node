@@ -26,7 +26,8 @@ setup(
         'console_scripts': [
             'master_control = master_control_node.master_control:main',
             'kinematic_sol = master_control_node.kinematic_solution:main',
-            'safety_pub = master_control_node.safety_pub:main'
+            'safety_pub = master_control_node.safety_pub:main',
+            'act_test = master_control_node.actuator_tester:main'
         ],
     },
 )
