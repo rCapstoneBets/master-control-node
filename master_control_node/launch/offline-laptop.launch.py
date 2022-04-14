@@ -50,4 +50,22 @@ def generate_launch_description():
             executable="act_test",
             output='screen',
         ),
+
+        Node(
+            package='diagnostic_aggregator',
+            executable='aggregator_node',
+            output='screen',
+            respawn=True,
+            arguments=['--ros-args', '--log-level', 'ERROR'],
+        ),  
+
+        # spoof the hardware node 
+        Node(
+            name="hardware_node",
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            respawn=True,
+            output='screen',
+            arguments=["0", "0", "0", "0", "0", "0", "lol", "whee"]
+        ),
     ])

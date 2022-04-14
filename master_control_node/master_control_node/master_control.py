@@ -6,7 +6,7 @@ from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.clock import Duration
 
-from std_msgs.msg import Bool, UInt8
+from std_msgs.msg import Bool, UInt8, Int8
 from can_msgs.msg import MotorMsg
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Pose
@@ -20,16 +20,16 @@ ANGULAR_TOLERANCE = 1.0
 
 # common states for the system
 IDLE_STATE = [ # system idle config that consumes less power
-    {"dem": 00.0, "mod": 1, "name": "pan_motor"},
-    {"dem": 30.0, "mod": 1, "name": "tilt_motor"},
+    {"dem": 00.0, "mod": 1, "name": "pan_motor", "min_max": [-50.0, 50.0]},
+    {"dem": 27.0, "mod": 1, "name": "tilt_motor", "min_max": [0.0, 40.0]},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
     {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
 ]
 
 ZERO_STATE = [ # full system idle in level position
-    {"dem": 00.0, "mod": 1, "name": "pan_motor"},
-    {"dem": 34.0, "mod": 1, "name": "tilt_motor"},
+    {"dem": 00.0, "mod": 1, "name": "pan_motor", "min_max": [-50.0, 50.0]},
+    {"dem": 34.0, "mod": 1, "name": "tilt_motor", "min_max": [0.0, 40.0]},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
     {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
@@ -48,6 +48,8 @@ FIRE_TIME_TOGGLE = 0.25 * 1000000000 # in ns
 SIGNAL_CLEAR_TIME = 2.5 * 1000000000 # in ns
 
 PAN_TILT_RATIO = 30.0
+PAN_MOTOR_LIMITS = [-40.0, 40.0]
+TILT_MOTOR_LIMITS = [0.0, 40.0]
 
 
 # expected node list to wait for before fully initializing
@@ -55,9 +57,9 @@ PAN_TILT_RATIO = 30.0
 EXPECTED_NODES = [
     'analyzers',
     'basic_trajectory',
-    'ekf_localization_node',
     'hardware_node',
-    'odom_to_world_broadcaster'
+    # 'ekf_localization_node',
+    # 'odom_to_world_broadcaster'
 ]
 
 '''
@@ -78,6 +80,9 @@ Approximate equality function
 '''
 def epsilonEquals(control, val, epsil):
     return control + epsil >= val and control - epsil <= val
+
+def bound(val, minVal, maxVal):
+    return max(minVal,  min(maxVal, val))
 
 class MasterControl(Node):
     def __init__(self):
@@ -123,6 +128,8 @@ class MasterControl(Node):
         self.lastJointState = JointState()
         self.trajectorySub = self.create_subscription(JointState, '/trajectory/desired_state', self.recieveTrajState, qos_profile_system_default)
         self.trajectoryState = JointState()
+        self.trajectoryValidSub = self.create_subscription(Int8, '/trajectory/valid', self.validTrajCb, qos_profile_system_default)
+        self.trajValid = False
 
         # setup signal subscriber
         self.signalSub = self.create_subscription(Bool, "/player/signal", self.playerSignalCb, qos_profile_system_default)
@@ -201,8 +208,10 @@ class MasterControl(Node):
 
             # get new point to look at
             moveState = IDLE_STATE
-            panDemand = self.extractJointState('pan_motor', self.trajectoryState)
-            moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
+
+            if(self.trajValid):
+                panDemand = self.extractJointState('pan_motor', self.trajectoryState)
+                moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
 
             # move robot to follow the point
             self.moveMachine(moveState)
@@ -210,7 +219,10 @@ class MasterControl(Node):
             # if we are in static mode, state 5 can exit to record point, or throw based on if record point is set
             # the player must signal first in either condition
             if(self.playerSignal and self.modeSelect == ControlMode.STATIC):
-                if(self.targetState is None):
+                if(not self.trajValid):
+                    self.get_logger().error(f'Signaled with invalid trajectory')
+
+                elif(self.targetState is None):
                     # mark entry time
                     self.signalBegin = self.get_clock().now()
 
@@ -323,16 +335,16 @@ class MasterControl(Node):
             self.enableTimer.cancel()
 
         # # handle whole system enable / disable if told to disable or enable times out (1/4 of a second)
-        # if(not self.lastEnableSys or (self.get_clock().now() - self.lastEnableTime) > Duration(nanoseconds=250000000)):
-        #     if(self.lastEnableSys): # prevent console spam in timeout event
-        #         self.get_logger().warning("System timed out from last system wide enable")
-        #         self.lastEnableSys = False
+        if(not self.lastEnableSys or (self.get_clock().now() - self.lastEnableTime) > Duration(nanoseconds=250000000)):
+            if(self.lastEnableSys): # prevent console spam in timeout event
+                self.get_logger().warning("System timed out from last system wide enable")
+                self.lastEnableSys = False
 
-        #     self.state = 2
+            self.state = 2
             
         # # enable if we were told to and state is sleep
-        # elif(self.lastEnableSys and self.state == 2):
-        #     self.state = 3
+        elif(self.lastEnableSys and self.state == 2):
+            self.state = 3
 
         # publish the current state for tracing of the system 
         stateMsg = UInt8()
@@ -416,8 +428,12 @@ class MasterControl(Node):
 
                 # update position
                 if(state["mod"] == 1  or state["mod"] == 7):
-                    # account for motor gear ratio and base offset
-                    state["dem"] -= jointState.position[idx] * PAN_TILT_RATIO
+                    if "min_max" in state:
+                        # account for motor gear ratio and base offset
+                        state['dem'] += bound(jointState.position[idx] * PAN_TILT_RATIO, state["min_max"][0], state["min_max"][1])
+                    else:
+                        # account for motor gear ratio and base offset
+                        state['dem'] += jointState.position[idx] * PAN_TILT_RATIO
 
                 # update velocity for wheel motors
                 elif(state["mod"] == 2):
@@ -433,8 +449,18 @@ class MasterControl(Node):
         # find the specific joint to edit
         for state in jointStates:
             if(joint in state["name"]):
-                state['dem'] = demand
-                break
+                if(state["mod"] == 1  or state["mod"] == 7):
+                    if "min_max" in state:
+                        state['dem'] = bound(demand * PAN_TILT_RATIO, state["min_max"][0], state["min_max"][1])
+                    else:
+                        state['dem'] = demand * PAN_TILT_RATIO
+                    break
+                elif(state["mod"] == 2):
+                    if "min_max" in state:
+                        state['dem'] = bound(demand, state["min_max"][0], state["min_max"][1])
+                    else:
+                        state['dem'] = demand
+                    break
 
         self.get_logger().debug(f"Moving {joint} to position {demand}")
 
@@ -464,6 +490,9 @@ class MasterControl(Node):
 
     def setRouteReady(self, msg: Bool):
         self.readyForRoute = msg.data
+
+    def validTrajCb(self, msg: Int8):
+        self.trajValid = msg.data == 0
 
 
 def main(args=None):
