@@ -1,4 +1,5 @@
 from enum import Enum
+from copy import deepcopy
 
 import rclpy
 from rclpy.node import Node
@@ -14,22 +15,28 @@ from geometry_msgs.msg import Pose
 # Positional tolerance for achieveing a given state
 ANGULAR_TOLERANCE = 1.0
 
+LOOSE_TOLERANCE = 7.0
+
+PAN_TILT_RATIO = 30.0
+PAN_MOTOR_LIMITS = [-40.0, 40.0]
+TILT_MOTOR_LIMITS = [0.0, 30.0]
+
 # control mode 0 is percent output
 # control mode 1 is position PID
 # control mode 2 is velocity PID
 
 # common states for the system
 IDLE_STATE = [ # system idle config that consumes less power
-    {"dem": 00.0, "mod": 1, "name": "pan_motor", "min_max": [-50.0, 50.0]},
-    {"dem": 27.0, "mod": 1, "name": "tilt_motor", "min_max": [0.0, 40.0]},
+    {"dem": 00.0, "mod": 7, "name": "pan_motor", "min_max": PAN_MOTOR_LIMITS},
+    {"dem": 26.0, "mod": 7, "name": "tilt_motor", "min_max": TILT_MOTOR_LIMITS},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
     {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
 ]
 
 ZERO_STATE = [ # full system idle in level position
-    {"dem": 00.0, "mod": 1, "name": "pan_motor", "min_max": [-50.0, 50.0]},
-    {"dem": 34.0, "mod": 1, "name": "tilt_motor", "min_max": [0.0, 40.0]},
+    {"dem": 00.0, "mod": 7, "name": "pan_motor", "min_max": PAN_MOTOR_LIMITS},
+    {"dem": 35.0, "mod": 7, "name": "tilt_motor", "min_max": TILT_MOTOR_LIMITS},
     {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
     {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
     {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
@@ -47,10 +54,6 @@ FIRE_TIME = 0.25 * 1000000000 # in ns
 FIRE_TIME_TOGGLE = 0.25 * 1000000000 # in ns
 SIGNAL_CLEAR_TIME = 2.5 * 1000000000 # in ns
 
-PAN_TILT_RATIO = 30.0
-PAN_MOTOR_LIMITS = [-40.0, 40.0]
-TILT_MOTOR_LIMITS = [0.0, 40.0]
-
 
 # expected node list to wait for before fully initializing
 # TODO finish this list with the portenta
@@ -58,6 +61,9 @@ EXPECTED_NODES = [
     'analyzers',
     'basic_trajectory',
     'hardware_node',
+    'zed_node',
+    'joint_state_pub',
+    'zed_translator'
     # 'ekf_localization_node',
     # 'odom_to_world_broadcaster'
 ]
@@ -92,7 +98,7 @@ class MasterControl(Node):
         self.signalBegin = self.get_clock().now()
         self.fireBegin = self.get_clock().now()
         self.targetState = JointState()
-        self.throwTarget = IDLE_STATE
+        self.throwTarget = deepcopy(IDLE_STATE)
         self.toggleIndex = 0
 
         # setup timers
@@ -149,7 +155,10 @@ class MasterControl(Node):
             # print(onlineNodes)
 
             for node in EXPECTED_NODES:
-                cmp = cmp and node in onlineNodes
+                nodeStat = node in onlineNodes
+                cmp = cmp and nodeStat
+                if(not nodeStat):
+                    self.get_logger().warning(f"Could not find '{node}' in {onlineNodes}")
     
             if cmp:
                 self.get_logger().info("All expected nodes online, transitioning to sleep state")
@@ -196,6 +205,7 @@ class MasterControl(Node):
                 else:
                     self.get_logger().info("Robot ready for static throw")
                     self.targetState = None # clear the last target point (if any)
+                    self.trajectoryState = JointState()
                     self.state = 5 # enter the static throw state
 
                 self.readyForRoute = False
@@ -207,14 +217,20 @@ class MasterControl(Node):
         elif(self.state == 5):
 
             # get new point to look at
-            moveState = IDLE_STATE
+            moveState = deepcopy(IDLE_STATE) # another case of the curse of python
 
             if(self.trajValid):
                 panDemand = self.extractJointState('pan_motor', self.trajectoryState)
-                moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
+                wheelDemand = self.extractJointState('left_wheel_motor', self.trajectoryState)
 
-            # move robot to follow the point
-            self.moveMachine(moveState)
+                # update pan for tracking and wheels due to ramp time
+                moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
+                moveState = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, moveState)
+                moveState = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, moveState)
+
+            # move robot to follow the point if we have excceded loose track
+            if(not self.machineInState(moveState, False)):
+                self.moveMachine(moveState)
 
             # if we are in static mode, state 5 can exit to record point, or throw based on if record point is set
             # the player must signal first in either condition
@@ -235,7 +251,17 @@ class MasterControl(Node):
                     self.state = 6 # goto record point state
                     
                 else:
-                    self.throwTarget = self.updateDemandStates(self.targetState, ZERO_STATE)
+                    
+                    panDemand = self.extractJointState('pan_motor', self.targetState)
+                    tiltDemand = self.extractJointState('tilt_motor', self.targetState)
+                    wheelDemand = self.extractJointState('left_wheel_motor', self.targetState)
+
+                    # update pan for tracking and wheels due to ramp time
+                    moveState = deepcopy(ZERO_STATE)
+                    moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
+                    moveState = self.updateDemandState('tilt_motor', tiltDemand.position, moveState, True) # need this axis to be incremental
+                    moveState = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, moveState)
+                    moveState = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, moveState)
 
                     self.get_logger().info(f'Moving to target position {self.throwTarget}')
                     
@@ -300,30 +326,30 @@ class MasterControl(Node):
         # from state 9 to 10, are the optimal trajectory mode
 
         # state 9, track predicted location
-        elif(self.state == 9):
-            pass
+        # elif(self.state == 9):
+        #     pass
 
-        # state 10, throw to predicted location
-        elif(self.state == 10):
-            pass
+        # # state 10, throw to predicted location
+        # elif(self.state == 10):
+        #     pass
 
-        # State 11 to 15 handle the self test routine
+        # # State 11 to 15 handle the self test routine
 
-        # state 11, azmuith diagnostic
-        if(self.state == 11):
-            pass
+        # # state 11, azmuith diagnostic
+        # if(self.state == 11):
+        #     pass
 
-        # state 12, elevation diagnostic
-        elif(self.state == 12):
-            pass
+        # # state 12, elevation diagnostic
+        # elif(self.state == 12):
+        #     pass
 
-        # state 13, soft throw test
-        elif(self.state == 13):
-            pass
+        # # state 13, soft throw test
+        # elif(self.state == 13):
+        #     pass
 
-        # state 14, hard throw test
-        elif(self.state == 14):
-            pass
+        # # state 14, hard throw test
+        # elif(self.state == 14):
+        #     pass
 
         # any state greater than 2 is an enabled system
         # need to reset the timer if state is greater than 2
@@ -374,24 +400,25 @@ class MasterControl(Node):
     '''
     Check if the machine is in the desired configuration yet
     '''
-    def machineInState(self, demandStates) -> bool:
+    def machineInState(self, demandStates, isTight: bool = True) -> bool:
         cmp = True
         for state in demandStates:
-            cmp = cmp and self.checkSingleState(state)
+            cmp = cmp and self.checkSingleState(state, isTight)
 
         return cmp
 
-    def checkSingleState(self, demandState) -> bool:
+    def checkSingleState(self, demandState, isTight: bool = True) -> bool:
         try:
             # grab index of motor to check
             i = self.lastJointState.name.index(demandState["name"])
 
+            tolSet = ANGULAR_TOLERANCE if isTight else LOOSE_TOLERANCE
 
             if(demandState["mod"] == 1 or demandState["mod"] == 7):
-                return epsilonEquals(demandState["dem"], self.lastJointState.position[i], ANGULAR_TOLERANCE)
+                return epsilonEquals(demandState["dem"], self.lastJointState.position[i], tolSet)
 
             elif(demandState["mod"] == 2):
-                return epsilonEquals(demandState["dem"], self.lastJointState.velocity[i], ANGULAR_TOLERANCE)
+                return epsilonEquals(demandState["dem"], self.lastJointState.velocity[i], tolSet)
 
             elif(demandState["mod"] == 0):
                 return True
@@ -418,37 +445,11 @@ class MasterControl(Node):
 
         return data
 
-
-    def updateDemandStates(self, jointState : JointState, demandStates):
-        # iterate all joint states
-        for state in demandStates:
-            try:
-                # find a match
-                idx = jointState.name.index(state["name"])
-
-                # update position
-                if(state["mod"] == 1  or state["mod"] == 7):
-                    if "min_max" in state:
-                        # account for motor gear ratio and base offset
-                        state['dem'] += bound(jointState.position[idx] * PAN_TILT_RATIO, state["min_max"][0], state["min_max"][1])
-                    else:
-                        # account for motor gear ratio and base offset
-                        state['dem'] += jointState.position[idx] * PAN_TILT_RATIO
-
-                # update velocity for wheel motors
-                elif(state["mod"] == 2):
-                    state["dem"]  = jointState.velocity[idx]
-
-            except ValueError:
-                # no match found, ignore
-                pass
-
-        return demandStates
-
-    def updateDemandState(self, joint: str, demand: float, jointStates):
+    def updateDemandState(self, joint: str, demand: float, jointStates, isIncremental: bool = False):
         # find the specific joint to edit
         for state in jointStates:
             if(joint in state["name"]):
+                oldDemand = state['dem']
                 if(state["mod"] == 1  or state["mod"] == 7):
                     if "min_max" in state:
                         state['dem'] = bound(demand * PAN_TILT_RATIO, state["min_max"][0], state["min_max"][1])
@@ -461,6 +462,8 @@ class MasterControl(Node):
                     else:
                         state['dem'] = demand
                     break
+                if(isIncremental):
+                    state['dem'] += oldDemand
 
         self.get_logger().debug(f"Moving {joint} to position {demand}")
 
