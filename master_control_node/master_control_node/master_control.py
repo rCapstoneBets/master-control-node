@@ -1,11 +1,14 @@
 from enum import Enum
 from copy import deepcopy
+import math
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.clock import Duration
+
+import numpy as np
 
 from std_msgs.msg import Bool, UInt8, Int8
 from can_msgs.msg import MotorMsg
@@ -14,49 +17,59 @@ from geometry_msgs.msg import Pose
 
 # Positional tolerance for achieveing a given state
 ANGULAR_TOLERANCE = 1.0
-
 LOOSE_TOLERANCE = 7.0
 
+# gear ratio for pan and tilt motor systems
 PAN_TILT_RATIO = 30.0
-PAN_MOTOR_LIMITS = [-40.0, 40.0]
-TILT_MOTOR_LIMITS = [0.0, 30.0]
+
+# center of mass for the tilt assembly measured from the rotation axis
+FIRING_COM = [0.039092, 0.107406, 0] # x, y, z (all in m)
+FIRING_MASS = 13.6077 # kg
+GRAVITY = 9.81 # m/s^2
+TILT_ARBFF_COEFF = 0.05 # strength of the arbitrary feed forward
 
 # control mode 0 is percent output
 # control mode 1 is position PID
 # control mode 2 is velocity PID
+# control mode 7 is motion magic PID
 
-# common states for the system
-IDLE_STATE = [ # system idle config that consumes less power
-    {"dem": 00.0, "mod": 7, "name": "pan_motor", "min_max": PAN_MOTOR_LIMITS},
-    {"dem": 26.0, "mod": 7, "name": "tilt_motor", "min_max": TILT_MOTOR_LIMITS},
-    {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
-    {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
-    {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
-]
+# specified bounds for motors
+MOTOR_BOUNDS = {
+    'pan_motor': [-40.0, 40.0],
+    'tilt_motor': [0.0, 30.0],
+}
 
-ZERO_STATE = [ # full system idle in level position
-    {"dem": 00.0, "mod": 7, "name": "pan_motor", "min_max": PAN_MOTOR_LIMITS},
-    {"dem": 35.0, "mod": 7, "name": "tilt_motor", "min_max": TILT_MOTOR_LIMITS},
-    {"dem": 50.0, "mod": 2, "name": "left_wheel_motor"}, 
-    {"dem": 50.0, "mod": 2, "name": "right_wheel_motor"},
-    {"dem": 0.00, "mod": 0, "name": "fire_solenoid"}
-]
+# Basic operational states for the robot
+IDLE_STATE = {
+    'pan_motor': MotorMsg(control_mode=7),
+    'tilt_motor': MotorMsg(control_mode=7, demand=26.0),
+    'left_wheel_motor': MotorMsg(control_mode=2, demand=50.0),
+    'right_wheel_motor': MotorMsg(control_mode=2, demand=50.0),
+    'fire_solenoid': MotorMsg(),
+}
 
-FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
-    {"dem": 1.0, "mod": 0, "name": "fire_solenoid"}
-]
+ZERO_STATE = {
+    'pan_motor': MotorMsg(control_mode=7),
+    'tilt_motor': MotorMsg(control_mode=7, demand=35.0),
+    'left_wheel_motor': MotorMsg(control_mode=2, demand=0.0),
+    'right_wheel_motor': MotorMsg(control_mode=2, demand=0.0),
+    'fire_solenoid': MotorMsg(),
+}
 
-END_FIRE_STATE = [ # trigger to fire the solenoid, and thus the ball!
-    {"dem": 0.0, "mod": 0, "name": "fire_solenoid"}
-]
+FIRE_STATE = {
+    'fire_solenoid': MotorMsg(demand=1.0),
+}
 
+END_FIRE_STATE = {
+    'fire_solenoid': MotorMsg(demand=1.0),
+}
+
+# Timing parameters
 FIRE_TIME = 0.25 * 1000000000 # in ns
-FIRE_TIME_TOGGLE = 0.25 * 1000000000 # in ns
 SIGNAL_CLEAR_TIME = 2.5 * 1000000000 # in ns
-
+SPIN_PERIOD = 0.05
 
 # expected node list to wait for before fully initializing
-# TODO finish this list with the portenta
 EXPECTED_NODES = [
     'analyzers',
     'basic_trajectory',
@@ -64,8 +77,6 @@ EXPECTED_NODES = [
     'zed_node',
     'joint_state_pub',
     'zed_translator'
-    # 'ekf_localization_node',
-    # 'odom_to_world_broadcaster'
 ]
 
 '''
@@ -76,6 +87,9 @@ class ControlMode(Enum):
     ROUTE_FIT = 1,
     TRUE_PRED = 2
 
+'''
+Container for holding a single joint representation
+'''
 class SingleJoint:
     position = 0.0
     velocity = 0.0
@@ -87,28 +101,30 @@ Approximate equality function
 def epsilonEquals(control, val, epsil):
     return control + epsil >= val and control - epsil <= val
 
+
+'''
+Function to place an input within certain bounds
+'''
 def bound(val, minVal, maxVal):
     return max(minVal,  min(maxVal, val))
 
 class MasterControl(Node):
     def __init__(self):
         super().__init__('master_control')
+
+        # main variables for the system
         self.state = 1
         self.modeSelect = ControlMode.STATIC
         self.signalBegin = self.get_clock().now()
         self.fireBegin = self.get_clock().now()
         self.targetState = JointState()
         self.throwTarget = deepcopy(IDLE_STATE)
-        self.toggleIndex = 0
 
         # setup timers
-        self.stateTimer = self.create_timer(0.05, self.stepControlStateMachine)
-        self.enableTimer = self.create_timer(0.01, self.sendSafetyEnable)
-        self.enableTimer.cancel()
+        self.stateTimer = self.create_timer(SPIN_PERIOD, self.stepControlStateMachine)
 
         # Safety systems
-        self.safetyPub = self.create_publisher(Bool, "/safety_enable", qos_profile_system_default)
-        self.enableSysSub = self.create_subscription(Bool, "/enable_sys", self.enableSysCb, qos_profile_system_default)
+        self.enableSysSub = self.create_subscription(Bool, "/safety_enable", self.enableSysCb, qos_profile_system_default)
         self.lastEnableSys = False
         self.lastEnableTime = Time()
         self.readyForRouteSub = self.create_subscription(Bool, "/route_start", self.setRouteReady, qos_profile_system_default)
@@ -118,7 +134,6 @@ class MasterControl(Node):
         self.statePub = self.create_publisher(UInt8, "/state_echo", qos_profile_system_default)
         self.stateSetSub = self.create_subscription(UInt8, '/state_set', self.setStateCb, qos_profile_system_default) # allow directly driving state for debug
         self.resetSub = self.create_subscription(Bool, "/reset", self.reset, qos_profile_system_default)
-
 
         # Setup publishers for actuators
         self.motorPubs = {
@@ -143,41 +158,36 @@ class MasterControl(Node):
 
         # Finish init stage
         self.get_logger().info("Master control initalized")
-        self.get_logger().info("Waiting for nodes {}".format(EXPECTED_NODES))
+        self.get_logger().info(f"Waiting for nodes {EXPECTED_NODES}")
 
     def stepControlStateMachine(self):
         # state 1, wait for system nodes to come online 
         if(self.state == 1):
-
             cmp = True
+
+            # verify the nodes are online
             onlineNodes = self.get_node_names()
-
-            # print(onlineNodes)
-
             for node in EXPECTED_NODES:
-                nodeStat = node in onlineNodes
-                cmp = cmp and nodeStat
-                if(not nodeStat):
+                if(not node in onlineNodes):
+                    cmp = False
                     self.get_logger().warning(f"Could not find '{node}' in {onlineNodes}")
     
             if cmp:
                 self.get_logger().info("All expected nodes online, transitioning to sleep state")
                 self.state = 2
 
-        # from state 2 to 4, is the wakeup group
+        # from state 2 to 3, is the wakeup group
 
         # state 2, sleep mode (motors disabled)
         # the machine cannot exit this without external help
         elif(self.state == 2):
-            if(not self.enableTimer.is_canceled()):
-                self.enableTimer.cancel()
+            if(self.lastEnableSys):
+                self.state = 3
             
 
         # state 3, wakeup calibration. move motors from powerd down state to idle
         elif(self.state == 3):
-            if(self.enableTimer.is_canceled()):
-                self.enableTimer.reset()
-                self.get_logger().info("Moving robot to idle state!")
+            self.get_logger().info("Moving robot to idle state!")
             
             # begin move to idle state and spin wheels
             self.moveMachine(IDLE_STATE) 
@@ -211,11 +221,10 @@ class MasterControl(Node):
                 self.readyForRoute = False
             
 
-        # from state 5 to 8 is the pre-planned trajectory path
+        # from state 5 to 7 is the pre-planned trajectory path
 
         # state 5, ocular track player until signal
         elif(self.state == 5):
-
             # get new point to look at
             moveState = deepcopy(IDLE_STATE) # another case of the curse of python
 
@@ -252,14 +261,16 @@ class MasterControl(Node):
                     
                 else:
                     
-                    panDemand = self.extractJointState('pan_motor', self.targetState)
-                    tiltDemand = self.extractJointState('tilt_motor', self.targetState)
+                    panDemand = self.extractJointState('pan_motor', self.targetState) 
                     wheelDemand = self.extractJointState('left_wheel_motor', self.targetState)
 
-                    # update pan for tracking and wheels due to ramp time
+                    # deal with tilt motor now 
+                    tiltDemand = self.extractJointState('tilt_motor', self.targetState)
+                    tiltArbFF = self.calcTiltArbFF(tiltDemand.position)
+
                     moveState = deepcopy(ZERO_STATE)
-                    moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
-                    moveState = self.updateDemandState('tilt_motor', tiltDemand.position, moveState, True) # need this axis to be incremental
+                    moveState = self.updateDemandState('pan_motor', panDemand.position * PAN_TILT_RATIO, moveState)
+                    moveState = self.updateDemandState('tilt_motor', tiltDemand.position * PAN_TILT_RATIO, moveState, True, tiltArbFF) # need this axis to be incremental and have arb ff
                     moveState = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, moveState)
                     moveState = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, moveState)
 
@@ -268,7 +279,7 @@ class MasterControl(Node):
                     # clear fire begin
                     self.fireBegin = None
 
-                    self.state = 8 # goto throw to static point state
+                    self.state = 7 # goto throw to static point state
 
 
         # state 6, record desired point
@@ -286,8 +297,8 @@ class MasterControl(Node):
                 self.state = 5
 
 
-        # state 8, throw preset
-        elif(self.state == 8):
+        # state 7, throw preset
+        elif(self.state == 7):
             # move to pre set
             
             self.moveMachine(self.throwTarget)
@@ -296,181 +307,126 @@ class MasterControl(Node):
             if(self.machineInState(self.throwTarget)):
 
                 iterStart = self.get_clock().now()
+
                 # handle when we just entered 
                 if(self.fireBegin is None):
                     self.fireBegin = iterStart
-                    self.toggleIndex = 0
                     self.get_logger().info("Robot moved to target position, Firing begin") 
                     self.moveMachine(FIRE_STATE)
 
                 # handle the end of firing sequence first
                 elif(iterStart - self.fireBegin > Duration(nanoseconds=int(FIRE_TIME))):
                     self.moveMachine(END_FIRE_STATE)
-                    self.toggleIndex = 0
                     self.playerSignal = False
                     self.get_logger().info("Firing complete") 
                     self.state = 4
 
-                # handle the solenoid on case
-                elif(self.toggleIndex % 2 == 0 and iterStart - self.fireBegin > Duration(nanoseconds=int((self.toggleIndex + 1) * FIRE_TIME_TOGGLE))):
-                    self.toggleIndex += 1
-                    self.moveMachine(FIRE_STATE)
-
-                # handle the solenoid off case
-                elif(self.toggleIndex % 2 == 1 and iterStart - self.fireBegin > Duration(nanoseconds=int(self.toggleIndex * FIRE_TIME_TOGGLE))):
-                    self.toggleIndex += 1
-                    self.moveMachine(END_FIRE_STATE)
-                
-            
-
-        # from state 9 to 10, are the optimal trajectory mode
-
-        # state 9, track predicted location
-        # elif(self.state == 9):
-        #     pass
-
-        # # state 10, throw to predicted location
-        # elif(self.state == 10):
-        #     pass
-
-        # # State 11 to 15 handle the self test routine
-
-        # # state 11, azmuith diagnostic
-        # if(self.state == 11):
-        #     pass
-
-        # # state 12, elevation diagnostic
-        # elif(self.state == 12):
-        #     pass
-
-        # # state 13, soft throw test
-        # elif(self.state == 13):
-        #     pass
-
-        # # state 14, hard throw test
-        # elif(self.state == 14):
-        #     pass
-
-        # any state greater than 2 is an enabled system
-        # need to reset the timer if state is greater than 2
-        if(self.state > 2 and self.enableTimer.is_canceled()):
-            self.enableTimer.reset()
-        
-        # if the state is less than 2 and the timer is not cancelled, cancel it
-        elif(self.state <= 2 and not self.enableTimer.is_canceled()):
-            self.enableTimer.cancel()
-
-        # # handle whole system enable / disable if told to disable or enable times out (1/4 of a second)
+        # handle whole system enable / disable if told to disable or enable times out (1/4 of a second)
         if(not self.lastEnableSys or (self.get_clock().now() - self.lastEnableTime) > Duration(nanoseconds=250000000)):
             if(self.lastEnableSys): # prevent console spam in timeout event
                 self.get_logger().warning("System timed out from last system wide enable")
                 self.lastEnableSys = False
 
             self.state = 2
-            
-        # # enable if we were told to and state is sleep
-        elif(self.lastEnableSys and self.state == 2):
-            self.state = 3
 
         # publish the current state for tracing of the system 
-        stateMsg = UInt8()
-        stateMsg.data = self.state
-        self.statePub.publish(stateMsg)
-            
-
-    def modeSetCallback(self):
-        pass
-
-    def sendSafetyEnable(self):
-        msg = Bool()
-        msg.data = True
-        self.safetyPub.publish(msg)
+        self.statePub.publish(UInt8(data=self.state))
+        
 
     '''
     Command a move from the machine to each of the motors that need to be moved
     '''
-    def moveMachine(self, demandStates):
-        for i in range(len(demandStates)) :
-            msg = MotorMsg()
-            msg.control_mode = demandStates[i]["mod"]
-            msg.demand = demandStates[i]["dem"]
+    def moveMachine(self, demandStates: dict):
+        for key in list(demandStates.keys()):
+            self.motorPubs[key].publish(demandStates[key])
 
-            self.motorPubs[demandStates[i]["name"]].publish(msg)
+    '''
+    calculates the arbitrary feed forward from torques for the tilt axis
+    '''
+    def calcTiltArbFF(self, angleFromZero: float) -> float:
+
+        rotMatrix = np.array([
+            [math.cos(angleFromZero), -math.sin(angleFromZero)],
+            [math.sin(angleFromZero), math.cos(angleFromZero)]
+        ])
+
+        # calculate the transformed point
+        transformedMassPt = rotMatrix.dot(np.array(FIRING_COM))
+        gravityVect = np.array([0, -GRAVITY * FIRING_MASS])
+
+        # calculate the apllied torque
+        torque = np.cross(transformedMassPt, gravityVect)
+
+        return torque[0] * TILT_ARBFF_COEFF
 
     '''
     Check if the machine is in the desired configuration yet
     '''
-    def machineInState(self, demandStates, isTight: bool = True) -> bool:
-        cmp = True
-        for state in demandStates:
-            cmp = cmp and self.checkSingleState(state, isTight)
+    def machineInState(self, demandStates: dict, isTight: bool = True) -> bool:
+        for key in list(demandStates.keys()):
+            if(not self.checkSingleState(key, demandStates[key], isTight)): return False
 
-        return cmp
+        return True
 
-    def checkSingleState(self, demandState, isTight: bool = True) -> bool:
+    def checkSingleState(self, joint: str, demandState: MotorMsg, isTight: bool = True) -> bool:
         try:
             # grab index of motor to check
-            i = self.lastJointState.name.index(demandState["name"])
+            i = self.lastJointState.name.index(joint)
 
-            tolSet = ANGULAR_TOLERANCE if isTight else LOOSE_TOLERANCE
+            # check equals based on control mode
+            if(demandState.control_mode == 1 or demandState.control_mode == 7):
+                return epsilonEquals(demandState.demand, self.lastJointState.position[i], ANGULAR_TOLERANCE if isTight else LOOSE_TOLERANCE)
 
-            if(demandState["mod"] == 1 or demandState["mod"] == 7):
-                return epsilonEquals(demandState["dem"], self.lastJointState.position[i], tolSet)
+            elif(demandState.control_mode == 2):
+                return epsilonEquals(demandState.demand, self.lastJointState.velocity[i], ANGULAR_TOLERANCE if isTight else LOOSE_TOLERANCE)
 
-            elif(demandState["mod"] == 2):
-                return epsilonEquals(demandState["dem"], self.lastJointState.velocity[i], tolSet)
-
-            elif(demandState["mod"] == 0):
+            elif(demandState.control_mode == 0):
                 return True
 
             else:
-                self.get_logger().warning(f"Unknown control mode {demandState['mod']}")
+                self.get_logger().warning(f"Unknown control mode {demandState.control_mode}")
                 return False
 
         except ValueError:
-            self.get_logger().warning(f"Could not find {demandState} in last joint state. Avaliable names: {self.lastJointState}")
+            self.get_logger().warning(f"Could not find {joint} in last joint state. Avaliable names: {self.lastJointState}")
             return False
+    
 
-    def extractJointState(self, name : str, states : JointState) -> SingleJoint:
+    def extractJointState(self, joint: str, states: JointState) -> SingleJoint:
         data = SingleJoint()
-
         try:
-            dataIdx = states.name.index(name)
+            dataIdx = states.name.index(joint)
             data.position = states.position[dataIdx]
             data.velocity = states.velocity[dataIdx]
             data.effort = states.effort[dataIdx]
-            return data
         except ValueError:
-            self.get_logger().error(f"could not find {name} in joint state {states}")
+            self.get_logger().error(f"could not find {joint} in joint state {states}")
 
         return data
 
-    def updateDemandState(self, joint: str, demand: float, jointStates, isIncremental: bool = False):
-        # find the specific joint to edit
-        for state in jointStates:
-            if(joint in state["name"]):
-                oldDemand = state['dem']
-                if(state["mod"] == 1  or state["mod"] == 7):
-                    if "min_max" in state:
-                        state['dem'] = bound(demand * PAN_TILT_RATIO, state["min_max"][0], state["min_max"][1])
-                    else:
-                        state['dem'] = demand * PAN_TILT_RATIO
-                    break
-                elif(state["mod"] == 2):
-                    if "min_max" in state:
-                        state['dem'] = bound(demand, state["min_max"][0], state["min_max"][1])
-                    else:
-                        state['dem'] = demand
-                    break
-                if(isIncremental):
-                    state['dem'] += oldDemand
+    '''
+    Take a joint state dict and update a particular value
+    handles bounding from list as well as incermental operation
+    '''
+    def updateDemandState(self, joint: str, demand: float, jointStates: dict, isIncremental: bool = False, arbFF: float = 0.0) -> dict:
+        # grab the arbitrary FF if present and update demand
+        jointStates[joint].arb_feedforward = arbFF
+
+        # if incremental increment, otherwise set
+        jointStates[joint].demand = (demand + jointStates[joint].demand) if isIncremental else demand
+
+        # Apply bounds to the motor after incremental
+        if joint in MOTOR_BOUNDS:
+            jointStates[joint].demand = bound(jointStates[joint].demand, MOTOR_BOUNDS[joint][0], MOTOR_BOUNDS[joint][1])
 
         self.get_logger().debug(f"Moving {joint} to position {demand}")
 
         return jointStates
 
+    '''
+    Callback functions below here for data endpoints
+    '''
     def reset(self):
-        self.enableTimer.cancel()
         self.playerSignal = False
         self.targetState = None
         self.state = 0
