@@ -23,10 +23,10 @@ LOOSE_TOLERANCE = 7.0
 PAN_TILT_RATIO = 30.0
 
 # center of mass for the tilt assembly measured from the rotation axis
-FIRING_COM = [0.039092, 0.107406, 0] # x, y, z (all in m)
+FIRING_COM = [0.039092, 0.107406] # x, z (all in m)
 FIRING_MASS = 13.6077 # kg
 GRAVITY = 9.81 # m/s^2
-TILT_ARBFF_COEFF = 0.05 # strength of the arbitrary feed forward
+TILT_ARBFF_COEFF = 0.03 # strength of the arbitrary feed forward
 
 # control mode 0 is percent output
 # control mode 1 is position PID
@@ -143,6 +143,7 @@ class MasterControl(Node):
             "pan_motor": self.create_publisher(MotorMsg, "/motor/pan_motor/demand", qos_profile_system_default),
             "fire_solenoid": self.create_publisher(MotorMsg, "/motor/fire_solenoid/demand", qos_profile_system_default),
         }
+        self.lastMotorSend = deepcopy(IDLE_STATE)
 
         # Setup joint state subscribers
         self.jointStateSub = self.create_subscription(JointState, "/motor/joint_state", self.recieveJointState, qos_profile_sensor_data)
@@ -231,9 +232,10 @@ class MasterControl(Node):
             if(self.trajValid):
                 panDemand = self.extractJointState('pan_motor', self.trajectoryState)
                 wheelDemand = self.extractJointState('left_wheel_motor', self.trajectoryState)
+                # self.get_logger().info(f"Extracted panDemand: {panDemand} wheelDemand: {wheelDemand} from valid trajectory")
 
                 # update pan for tracking and wheels due to ramp time
-                moveState = self.updateDemandState('pan_motor', panDemand.position, moveState)
+                moveState = self.updateDemandState('pan_motor', panDemand.position * PAN_TILT_RATIO, moveState)
                 moveState = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, moveState)
                 moveState = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, moveState)
 
@@ -245,7 +247,7 @@ class MasterControl(Node):
             # the player must signal first in either condition
             if(self.playerSignal and self.modeSelect == ControlMode.STATIC):
                 if(not self.trajValid):
-                    self.get_logger().error(f'Signaled with invalid trajectory')
+                    self.get_logger().error('Signaled with invalid trajectory')
 
                 elif(self.targetState is None):
                     # mark entry time
@@ -255,7 +257,6 @@ class MasterControl(Node):
                     self.targetState = self.trajectoryState
                     
                     self.get_logger().info(f'Recording to target position {self.targetState}')
-                    self.get_logger().debug(f'Waiting for signal to clear or timeout')
 
                     self.state = 6 # goto record point state
                     
@@ -266,13 +267,12 @@ class MasterControl(Node):
 
                     # deal with tilt motor now 
                     tiltDemand = self.extractJointState('tilt_motor', self.targetState)
-                    tiltArbFF = self.calcTiltArbFF(tiltDemand.position)
 
-                    moveState = deepcopy(ZERO_STATE)
-                    moveState = self.updateDemandState('pan_motor', panDemand.position * PAN_TILT_RATIO, moveState)
-                    moveState = self.updateDemandState('tilt_motor', tiltDemand.position * PAN_TILT_RATIO, moveState, True, tiltArbFF) # need this axis to be incremental and have arb ff
-                    moveState = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, moveState)
-                    moveState = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, moveState)
+                    self.throwTarget = deepcopy(ZERO_STATE)
+                    self.throwTarget = self.updateDemandState('pan_motor', panDemand.position * PAN_TILT_RATIO, self.throwTarget)
+                    self.throwTarget = self.updateDemandState('tilt_motor', tiltDemand.position * PAN_TILT_RATIO, self.throwTarget, True) # need this axis to be incremental and have arb ff
+                    self.throwTarget = self.updateDemandState('left_wheel_motor', wheelDemand.velocity, self.throwTarget)
+                    self.throwTarget = self.updateDemandState('right_wheel_motor', wheelDemand.velocity, self.throwTarget)
 
                     self.get_logger().info(f'Moving to target position {self.throwTarget}')
                     
@@ -331,19 +331,30 @@ class MasterControl(Node):
 
         # publish the current state for tracing of the system 
         self.statePub.publish(UInt8(data=self.state))
-        
+
+        # grab the latest tilt position and calc FF
+        tiltDemand = self.extractJointState('tilt_motor', self.lastJointState)
+        angle = (tiltDemand.position - ZERO_STATE['tilt_motor'].demand) / PAN_TILT_RATIO
+        self.calcTiltArbFF(angle)
+
+        # send the desired state of the motors
+        self.sendMachine(self.lastMotorSend)
 
     '''
     Command a move from the machine to each of the motors that need to be moved
     '''
     def moveMachine(self, demandStates: dict):
         for key in list(demandStates.keys()):
+            self.lastMotorSend[key] = demandStates[key]
+
+    def sendMachine(self, demandStates: dict):
+        for key in list(demandStates.keys()):
             self.motorPubs[key].publish(demandStates[key])
 
     '''
     calculates the arbitrary feed forward from torques for the tilt axis
     '''
-    def calcTiltArbFF(self, angleFromZero: float) -> float:
+    def calcTiltArbFF(self, angleFromZero: float):
 
         rotMatrix = np.array([
             [math.cos(angleFromZero), -math.sin(angleFromZero)],
@@ -357,7 +368,7 @@ class MasterControl(Node):
         # calculate the apllied torque
         torque = np.cross(transformedMassPt, gravityVect)
 
-        return torque[0] * TILT_ARBFF_COEFF
+        self.lastMotorSend['tilt_motor'].arb_feedforward = float(torque * -TILT_ARBFF_COEFF)
 
     '''
     Check if the machine is in the desired configuration yet
@@ -408,10 +419,7 @@ class MasterControl(Node):
     Take a joint state dict and update a particular value
     handles bounding from list as well as incermental operation
     '''
-    def updateDemandState(self, joint: str, demand: float, jointStates: dict, isIncremental: bool = False, arbFF: float = 0.0) -> dict:
-        # grab the arbitrary FF if present and update demand
-        jointStates[joint].arb_feedforward = arbFF
-
+    def updateDemandState(self, joint: str, demand: float, jointStates: dict, isIncremental: bool = False) -> dict:
         # if incremental increment, otherwise set
         jointStates[joint].demand = (demand + jointStates[joint].demand) if isIncremental else demand
 
