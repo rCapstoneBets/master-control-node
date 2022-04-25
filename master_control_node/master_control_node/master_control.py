@@ -124,37 +124,37 @@ class MasterControl(Node):
         self.stateTimer = self.create_timer(SPIN_PERIOD, self.stepControlStateMachine)
 
         # Safety systems
-        self.enableSysSub = self.create_subscription(Bool, "/safety_enable", self.enableSysCb, qos_profile_system_default)
+        self.enableSysSub = self.create_subscription(Bool, "safety_enable", self.enableSysCb, qos_profile_system_default)
         self.lastEnableSys = False
         self.lastEnableTime = Time()
-        self.readyForRouteSub = self.create_subscription(Bool, "/route_start", self.setRouteReady, qos_profile_system_default)
+        self.readyForRouteSub = self.create_subscription(Bool, "route_start", self.setRouteReady, qos_profile_system_default)
         self.readyForRoute = False
 
         # State machine debugging
-        self.statePub = self.create_publisher(UInt8, "/state_echo", qos_profile_system_default)
-        self.stateSetSub = self.create_subscription(UInt8, '/state_set', self.setStateCb, qos_profile_system_default) # allow directly driving state for debug
-        self.resetSub = self.create_subscription(Bool, "/reset", self.reset, qos_profile_system_default)
+        self.statePub = self.create_publisher(UInt8, "state_echo", qos_profile_system_default)
+        self.stateSetSub = self.create_subscription(UInt8, 'state_set', self.setStateCb, qos_profile_system_default) # allow directly driving state for debug
+        self.resetSub = self.create_subscription(Bool, "reset", self.reset, qos_profile_system_default)
 
         # Setup publishers for actuators
         self.motorPubs = {
-            "left_wheel_motor": self.create_publisher(MotorMsg, "/motor/left_wheel_motor/demand", qos_profile_system_default),
-            "right_wheel_motor": self.create_publisher(MotorMsg, "/motor/right_wheel_motor/demand", qos_profile_system_default),
-            "tilt_motor": self.create_publisher(MotorMsg, "/motor/tilt_motor/demand", qos_profile_system_default),
-            "pan_motor": self.create_publisher(MotorMsg, "/motor/pan_motor/demand", qos_profile_system_default),
-            "fire_solenoid": self.create_publisher(MotorMsg, "/motor/fire_solenoid/demand", qos_profile_system_default),
+            "left_wheel_motor": self.create_publisher(MotorMsg, "motor/left_wheel_motor/demand", qos_profile_system_default),
+            "right_wheel_motor": self.create_publisher(MotorMsg, "motor/right_wheel_motor/demand", qos_profile_system_default),
+            "tilt_motor": self.create_publisher(MotorMsg, "motor/tilt_motor/demand", qos_profile_system_default),
+            "pan_motor": self.create_publisher(MotorMsg, "motor/pan_motor/demand", qos_profile_system_default),
+            "fire_solenoid": self.create_publisher(MotorMsg, "motor/fire_solenoid/demand", qos_profile_system_default),
         }
         self.lastMotorSend = deepcopy(IDLE_STATE)
 
         # Setup joint state subscribers
-        self.jointStateSub = self.create_subscription(JointState, "/motor/joint_state", self.recieveJointState, qos_profile_sensor_data)
+        self.jointStateSub = self.create_subscription(JointState, "motor/joint_state", self.recieveJointState, qos_profile_sensor_data)
         self.lastJointState = JointState()
-        self.trajectorySub = self.create_subscription(JointState, '/trajectory/desired_state', self.recieveTrajState, qos_profile_system_default)
+        self.trajectorySub = self.create_subscription(JointState, 'trajectory/desired_state', self.recieveTrajState, qos_profile_system_default)
         self.trajectoryState = JointState()
-        self.trajectoryValidSub = self.create_subscription(Int8, '/trajectory/valid', self.validTrajCb, qos_profile_system_default)
+        self.trajectoryValidSub = self.create_subscription(Int8, 'trajectory/valid', self.validTrajCb, qos_profile_system_default)
         self.trajValid = False
 
         # setup signal subscriber
-        self.signalSub = self.create_subscription(Bool, "/player/signal", self.playerSignalCb, qos_profile_system_default)
+        self.signalSub = self.create_subscription(Bool, "player/signal", self.playerSignalCb, qos_profile_system_default)
         self.playerSignal = False
 
         # Finish init stage
@@ -286,7 +286,7 @@ class MasterControl(Node):
         elif(self.state == 6):
             # wait a few seconds for signal to clear or signal clear
             iterStart = self.get_clock().now()
-            if(not self.playerSignal or iterStart - self.signalBegin > Duration(nanoseconds=int(SIGNAL_CLEAR_TIME))):
+            if(iterStart - self.signalBegin > Duration(nanoseconds=int(SIGNAL_CLEAR_TIME))):
                 self.get_logger().info(f'Player signal cleared')
 
                 # Clear player signal
